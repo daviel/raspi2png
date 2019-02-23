@@ -1,8 +1,8 @@
-OBJS=raspi2png.o
+OBJS=raspi2png.o dma.o mailbox.o pcm.o pwm.o rpihw.o ws2811.o
 BIN=raspi2png
 
-CFLAGS+=-Wall -g -O3 $(shell libpng-config --cflags)
-LDFLAGS+=-L/opt/vc/lib/ -lbcm_host $(shell libpng-config --ldflags) -lm
+CFLAGS+=-Wall -g -O3
+LDFLAGS+=-L/opt/vc/lib/ -lbcm_host -lm
 
 INCLUDES+=-I/opt/vc/include/ -I/opt/vc/include/interface/vcos/pthreads -I/opt/vc/include/interface/vmcs_host/linux
 
@@ -13,7 +13,7 @@ install: $(BIN)
 	install -m 755 $(BIN) $(DESTDIR)/usr/bin/raspi2png
 
 %.o: %.c
-	@rm -f $@ 
+	@rm -f $@
 	$(CC) $(CFLAGS) $(INCLUDES) -g -c $< -o $@ -Wno-deprecated-declarations
 
 $(BIN): $(OBJS)

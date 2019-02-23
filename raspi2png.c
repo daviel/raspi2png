@@ -27,17 +27,37 @@
 
 #define _GNU_SOURCE
 
-#include <getopt.h>
 #include <math.h>
-#include <png.h>
 #include <stdbool.h>
+#include <zlib.h>
+
+#include <time.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <zlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <getopt.h>
+
+#include "clk.h"
+#include "gpio.h"
+#include "dma.h"
+#include "pwm.h"
+#include "ws2811.h"
 
 #include "bcm_host.h"
+
+typedef struct {
+  char red;
+  char green;
+  char blue;
+} Color;
 
 //-----------------------------------------------------------------------
 
@@ -47,9 +67,7 @@
 
 //-----------------------------------------------------------------------
 
-#define DEFAULT_DELAY 0
 #define DEFAULT_DISPLAY_NUMBER 0
-#define DEFAULT_NAME "snapshot.png"
 
 //-----------------------------------------------------------------------
 
@@ -57,42 +75,92 @@ const char* program = NULL;
 
 //-----------------------------------------------------------------------
 
-void
-usage(void)
+void calculate_colors(void);
+void calculate_top(void);
+void calculate_left(void);
+void calculate_right(void);
+void calculate_bottom(void);
+void screenshot(void);
+void image_get_average_color(int xOffset, int yOffset, int xWidth, int yHeight);
+void init(void);
+
+int BLOCKSIZE_DIVISION_OF_RESOLUTION = 20; // means resolution divided by
+
+int RESOLUTION_X = 1920;
+int RESOLUTION_Y = 1080;
+int TARGET_FPS = 24;
+
+int RIGHT_START_LED = 95;
+int RIGHT_STOP_LED = 123;
+
+int TOP_START_LED = 123;
+int TOP_STOP_LED = 174;
+
+int LEFT_START_LED = 174;
+int LEFT_STOP_LED = 204;
+
+int BOTTOM_START_LED = 204;
+int BOTTOM_STOP_LED = 255;
+
+
+int RIGHT_LENGTH;
+int TOP_LENGTH;
+int LEFT_LENGTH;
+int BOTTOM_LENGTH;
+
+int TOP_BLOCKSIZE_X;
+int TOP_BLOCKSIZE_Y;
+
+int BOTTOM_BLOCKSIZE_X;
+int BOTTOM_BLOCKSIZE_Y;
+
+int LEFT_BLOCKSIZE_X;
+int LEFT_BLOCKSIZE_Y;
+
+int RIGHT_BLOCKSIZE_X;
+int RIGHT_BLOCKSIZE_Y;
+
+
+// defaults for cmdline options
+#define TARGET_FREQ             WS2811_TARGET_FREQ
+#define GPIO_PIN                18
+#define DMA                     10
+//#define STRIP_TYPE            WS2811_STRIP_RGB                // WS2812/SK6812RGB integrated chip+leds
+#define STRIP_TYPE              WS2811_STRIP_GBR                // WS2812/SK6812RGB integrated chip+leds
+//#define STRIP_TYPE            SK6812_STRIP_RGBW               // SK6812RGBW (NOT SK6812RGB)
+#define LED_COUNT               300
+
+
+ws2811_t ledstring =
 {
-    fprintf(stderr, "Usage: %s [--pngname name]", program);
-    fprintf(stderr, " [--width <width>] [--height <height>]");
-    fprintf(stderr, " [--compression <level>]");
-    fprintf(stderr, " [--delay <delay>] [--display <number>]");
-    fprintf(stderr, " [--stdout] [--help]\n");
+    .freq = TARGET_FREQ,
+    .dmanum = DMA,
+    .channel =
+    {
+        [0] =
+        {
+            .gpionum = GPIO_PIN,
+            .count = LED_COUNT,
+            .invert = 0,
+            .brightness = 255,
+            .strip_type = STRIP_TYPE,
+        },
+        [1] =
+        {
+            .gpionum = 0,
+            .count = 0,
+            .invert = 0,
+            .brightness = 0,
+        },
+    },
+};
 
-    fprintf(stderr, "\n");
-
-    fprintf(stderr, "    --pngname,-p - name of png file to create ");
-    fprintf(stderr, "(default is %s)\n", DEFAULT_NAME);
-
-    fprintf(stderr, "    --height,-h - image height ");
-    fprintf(stderr, "(default is screen height)\n");
-
-    fprintf(stderr, "    --width,-w - image width ");
-    fprintf(stderr, "(default is screen width)\n");
-
-    fprintf(stderr, "    --compression,-c - PNG compression level ");
-    fprintf(stderr, "(0 - 9)\n");
-
-    fprintf(stderr, "    --delay,-d - delay in seconds ");
-    fprintf(stderr, "(default %d)\n", DEFAULT_DELAY);
-
-    fprintf(stderr, "    --display,-D - Raspberry Pi display number ");
-    fprintf(stderr, "(default %d)\n", DEFAULT_DISPLAY_NUMBER);
-
-    fprintf(stderr, "    --stdout,-s - write file to stdout\n");
-
-    fprintf(stderr, "    --help,-H - print this usage information\n");
-
-    fprintf(stderr, "\n");
-}
-
+Color *color;
+void *dmxImagePtr;
+VC_RECT_T rect;
+DISPMANX_DISPLAY_HANDLE_T displayHandle;
+DISPMANX_RESOURCE_HANDLE_T resourceHandle;
+int32_t dmxPitch;
 
 //-----------------------------------------------------------------------
 
@@ -101,134 +169,23 @@ main(
     int argc,
     char *argv[])
 {
-    int opt = 0;
-
-    bool writeToStdout = false;
-    char *pngName = DEFAULT_NAME;
-    int32_t requestedWidth = 0;
-    int32_t requestedHeight = 0;
-    uint32_t displayNumber = DEFAULT_DISPLAY_NUMBER;
-    int compression = Z_DEFAULT_COMPRESSION;
-    int delay = DEFAULT_DELAY;
-
-    VC_IMAGE_TYPE_T imageType = VC_IMAGE_RGBA32;
-    int8_t dmxBytesPerPixel  = 4;
-
+    printf("Started!\n");
     int result = 0;
-
+    uint32_t displayNumber = DEFAULT_DISPLAY_NUMBER;
+    VC_IMAGE_TYPE_T imageType = VC_IMAGE_RGBA32;
     program = basename(argv[0]);
-
-    //-------------------------------------------------------------------
-
-    char *sopts = "c:d:D:Hh:p:w:s";
-
-    struct option lopts[] =
-    {
-        { "compression", required_argument, NULL, 'c' },
-        { "delay", required_argument, NULL, 'd' },
-        { "display", required_argument, NULL, 'D' },
-        { "height", required_argument, NULL, 'h' },
-        { "help", no_argument, NULL, 'H' },
-        { "pngname", required_argument, NULL, 'p' },
-        { "width", required_argument, NULL, 'w' },
-        { "stdout", no_argument, NULL, 's' },
-        { NULL, no_argument, NULL, 0 }
-    };
-
-    while ((opt = getopt_long(argc, argv, sopts, lopts, NULL)) != -1)
-    {
-        switch (opt)
-        {
-        case 'c':
-
-            compression = atoi(optarg);
-
-            if ((compression < 0) || (compression > 9))
-            {
-                compression = Z_DEFAULT_COMPRESSION;
-            }
-
-            break;
-
-        case 'd':
-
-            delay = atoi(optarg);
-            break;
-
-        case 'D':
-
-            displayNumber = atoi(optarg);
-            break;
-
-        case 'h':
-
-            requestedHeight = atoi(optarg);
-            break;
-
-        case 'p':
-
-            pngName = optarg;
-            break;
-
-        case 'w':
-
-            requestedWidth = atoi(optarg);
-            break;
-
-        case 's':
-
-            writeToStdout = true;
-            break;
-
-        case 'H':
-        default:
-
-            usage();
-
-            if (opt == 'H')
-            {
-                exit(EXIT_SUCCESS);
-            }
-            else
-            {
-                exit(EXIT_FAILURE);
-            }
-
-            break;
-        }
-    }
-
-    //-------------------------------------------------------------------
-
     bcm_host_init();
+    init();
 
-    //-------------------------------------------------------------------
-    //
-    // When the display is rotate (either 90 or 270 degrees) we need to
-    // swap the width and height of the snapshot
-    //
+    ws2811_return_t ret;
 
-    char response[1024];
-    int displayRotated = 0;
-
-    if (vc_gencmd(response, sizeof(response), "get_config int") == 0)
+    if ((ret = ws2811_init(&ledstring)) != WS2811_SUCCESS)
     {
-        vc_gencmd_number_property(response,
-                                  "display_rotate",
-                                  &displayRotated);
+      fprintf(stderr, "ws2811_init failed: %s\n", ws2811_get_return_t_str(ret));
+      return ret;
     }
 
-    //-------------------------------------------------------------------
-
-    if (delay)
-    {
-        sleep(delay);
-    }
-
-    //-------------------------------------------------------------------
-
-    DISPMANX_DISPLAY_HANDLE_T displayHandle
-        = vc_dispmanx_display_open(displayNumber);
+    displayHandle = vc_dispmanx_display_open(displayNumber);
 
     if (displayHandle == 0)
     {
@@ -249,348 +206,172 @@ main(
         exit(EXIT_FAILURE);
     }
 
-    int32_t pngWidth = modeInfo.width;
-    int32_t pngHeight = modeInfo.height;
-
-    if (requestedWidth > 0)
-    {
-        pngWidth = requestedWidth;
-
-        if (requestedHeight == 0)
-        {
-            double numerator = modeInfo.height * requestedWidth;
-            double denominator = modeInfo.width;
-
-            pngHeight = (int32_t)ceil(numerator / denominator);
-        }
-    }
-
-    if (requestedHeight > 0)
-    {
-        pngHeight = requestedHeight;
-
-        if (requestedWidth == 0)
-        {
-            double numerator = modeInfo.width * requestedHeight;
-            double denominator = modeInfo.height;
-
-            pngWidth = (int32_t)ceil(numerator / denominator);
-        }
-    }
-
     //-------------------------------------------------------------------
-    // only need to check low bit of displayRotated (value of 1 or 3).
-    // If the display is rotated either 90 or 270 degrees (value 1 or 3)
-    // the width and height need to be transposed.
 
-    int32_t dmxWidth = pngWidth;
-    int32_t dmxHeight = pngHeight;
-
-    if (displayRotated & 1)
-    {
-        dmxWidth = pngHeight;
-        dmxHeight = pngWidth;
-    }
-
-    int32_t dmxPitch = dmxBytesPerPixel * ALIGN_TO_16(dmxWidth);
-
-    void *dmxImagePtr = malloc(dmxPitch * dmxHeight);
-
-    if (dmxImagePtr == NULL)
-    {
-        fprintf(stderr, "%s: unable to allocated image buffer\n", program);
-        exit(EXIT_FAILURE);
-    }
+    dmxPitch = sizeof(int) * ALIGN_TO_16(RESOLUTION_X);
+    dmxImagePtr = malloc(TOP_BLOCKSIZE_Y * dmxPitch);
 
     //-------------------------------------------------------------------
 
     uint32_t vcImagePtr = 0;
-    DISPMANX_RESOURCE_HANDLE_T resourceHandle;
     resourceHandle = vc_dispmanx_resource_create(imageType,
-                                                 dmxWidth,
-                                                 dmxHeight,
+                                                 RESOLUTION_X,
+                                                 RESOLUTION_Y,
                                                  &vcImagePtr);
 
-    result = vc_dispmanx_snapshot(displayHandle,
-                                  resourceHandle,
-                                  DISPMANX_NO_ROTATE);
+    //-------------------------------------------------------------------
 
-    if (result != 0)
-    {
-        vc_dispmanx_resource_delete(resourceHandle);
-        vc_dispmanx_display_close(displayHandle);
 
-        fprintf(stderr, "%s: vc_dispmanx_snapshot() failed\n", program);
-        exit(EXIT_FAILURE);
+    struct timespec ts;
+    float frame_time = 1/(float) TARGET_FPS;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = 500000000L;
+    double render_time = 0;
+
+    for(int led_num = 0; led_num < 300; led_num++)
+      ledstring.channel[0].leds[led_num] = 0;
+
+    while(1){
+      clock_t start = clock();
+      screenshot();
+      calculate_colors();
+      clock_t end = clock();
+      render_time = (double)(end-start) / CLOCKS_PER_SEC;
+
+      if ((ret = ws2811_render(&ledstring)) != WS2811_SUCCESS)
+      {
+        fprintf(stderr, "ws2811_render failed: %s\n", ws2811_get_return_t_str(ret));
+        break;
+      }
+
+      //printf("Elapsed time: %.6f seconds\n", render_time);
+
+      if(render_time >= frame_time){
+
+      }else{
+        ts.tv_nsec = (frame_time - render_time) * 1000000000;
+        nanosleep(&ts, NULL);
+      }
     }
 
-    VC_RECT_T rect;
-    result = vc_dispmanx_rect_set(&rect, 0, 0, dmxWidth, dmxHeight);
-
-    if (result != 0)
-    {
-        vc_dispmanx_resource_delete(resourceHandle);
-        vc_dispmanx_display_close(displayHandle);
-
-        fprintf(stderr, "%s: vc_dispmanx_rect_set() failed\n", program);
-        exit(EXIT_FAILURE);
-    }
-
-    result = vc_dispmanx_resource_read_data(resourceHandle,
-                                            &rect,
-                                            dmxImagePtr,
-                                            dmxPitch);
-
-
-    if (result != 0)
-    {
-        vc_dispmanx_resource_delete(resourceHandle);
-        vc_dispmanx_display_close(displayHandle);
-
-        fprintf(stderr,
-                "%s: vc_dispmanx_resource_read_data() failed\n",
-                program);
-
-        exit(EXIT_FAILURE);
-    }
+    //-------------------------------------------------------------------
 
     vc_dispmanx_resource_delete(resourceHandle);
     vc_dispmanx_display_close(displayHandle);
-
-    //-------------------------------------------------------------------
-    // Convert from RGBA (32 bit) to RGB (24 bit)
-
-    int8_t pngBytesPerPixel = 3;
-    int32_t pngPitch = pngBytesPerPixel * pngWidth;
-    void *pngImagePtr = malloc(pngPitch * pngHeight);
-
-    int32_t j = 0;
-    for (j = 0 ; j < pngHeight ; j++)
-    {
-        int32_t dmxXoffset = 0;
-        int32_t dmxYoffset = 0;
-
-        switch (displayRotated & 3)
-        {
-        case 0: // 0 degrees
-
-            if (displayRotated & 0x20000) // flip vertical
-            {
-                dmxYoffset = (dmxHeight - j - 1) * dmxPitch;
-            }
-            else
-            {
-                dmxYoffset = j * dmxPitch;
-            }
-
-            break;
-
-        case 1: // 90 degrees
-
-
-            if (displayRotated & 0x20000) // flip vertical
-            {
-                dmxXoffset = j * dmxBytesPerPixel;
-            }
-            else
-            {
-                dmxXoffset = (dmxWidth - j - 1) * dmxBytesPerPixel;
-            }
-
-            break;
-
-        case 2: // 180 degrees
-
-            if (displayRotated & 0x20000) // flip vertical
-            {
-                dmxYoffset = j * dmxPitch;
-            }
-            else
-            {
-                dmxYoffset = (dmxHeight - j - 1) * dmxPitch;
-            }
-
-            break;
-
-        case 3: // 270 degrees
-
-            if (displayRotated & 0x20000) // flip vertical
-            {
-                dmxXoffset = (dmxWidth - j - 1) * dmxBytesPerPixel;
-            }
-            else
-            {
-                dmxXoffset = j * dmxBytesPerPixel;
-            }
-
-            break;
-        }
-
-        int32_t i = 0;
-        for (i = 0 ; i < pngWidth ; i++)
-        {
-            uint8_t *pngPixelPtr = pngImagePtr
-                                 + (i * pngBytesPerPixel)
-                                 + (j * pngPitch);
-
-            switch (displayRotated & 3)
-            {
-            case 0: // 0 degrees
-
-                if (displayRotated & 0x10000) // flip horizontal
-                {
-                    dmxXoffset = (dmxWidth - i - 1) * dmxBytesPerPixel;
-                }
-                else
-                {
-                    dmxXoffset = i * dmxBytesPerPixel;
-                }
-
-                break;
-
-            case 1: // 90 degrees
-
-                if (displayRotated & 0x10000) // flip horizontal
-                {
-                    dmxYoffset = (dmxHeight - i - 1) * dmxPitch;
-                }
-                else
-                {
-                    dmxYoffset = i * dmxPitch;
-                }
-
-                break;
-
-            case 2: // 180 degrees
-
-                if (displayRotated & 0x10000) // flip horizontal
-                {
-                    dmxXoffset = i * dmxBytesPerPixel;
-                }
-                else
-                {
-                    dmxXoffset = (dmxWidth - i - 1) * dmxBytesPerPixel;
-                }
-
-                break;
-
-            case 3: // 270 degrees
-
-                if (displayRotated & 0x10000) // flip horizontal
-                {
-                    dmxYoffset = i * dmxPitch;
-                }
-                else
-                {
-                    dmxYoffset = (dmxHeight - i - 1) * dmxPitch;
-                }
-
-                break;
-            }
-
-            uint8_t *dmxPixelPtr = dmxImagePtr + dmxXoffset + dmxYoffset;
-
-            memcpy(pngPixelPtr, dmxPixelPtr, 3);
-        }
-    }
-
-    free(dmxImagePtr);
-    dmxImagePtr = NULL;
-
-    //-------------------------------------------------------------------
-
-    png_structp pngPtr = png_create_write_struct(PNG_LIBPNG_VER_STRING,
-                                                 NULL,
-                                                 NULL,
-                                                 NULL);
-
-    if (pngPtr == NULL)
-    {
-        fprintf(stderr,
-                "%s: unable to allocated PNG write structure\n",
-                program);
-
-        exit(EXIT_FAILURE);
-    }
-
-    png_infop infoPtr = png_create_info_struct(pngPtr);
-
-    if (infoPtr == NULL)
-    {
-        fprintf(stderr,
-                "%s: unable to allocated PNG info structure\n",
-                program);
-
-        exit(EXIT_FAILURE);
-    }
-
-    if (setjmp(png_jmpbuf(pngPtr)))
-    {
-        fprintf(stderr, "%s: unable to create PNG\n", program);
-        exit(EXIT_FAILURE);
-    }
-
-    FILE *pngfp = NULL;
-
-    if (writeToStdout)
-    {
-        pngfp = stdout;
-    }
-    else
-    {
-        pngfp = fopen(pngName, "wb");
-
-        if (pngfp == NULL)
-        {
-            fprintf(stderr,
-                    "%s: unable to create %s - %s\n",
-                    program,
-                    pngName,
-                    strerror(errno));
-
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    png_init_io(pngPtr, pngfp);
-
-    png_set_IHDR(
-        pngPtr,
-        infoPtr,
-        pngWidth,
-        pngHeight,
-        8,
-        PNG_COLOR_TYPE_RGB,
-        PNG_INTERLACE_NONE,
-        PNG_COMPRESSION_TYPE_BASE,
-        PNG_FILTER_TYPE_BASE);
-
-    if (compression != Z_DEFAULT_COMPRESSION)
-    {
-        png_set_compression_level(pngPtr, compression);
-    }
-
-    png_write_info(pngPtr, infoPtr);
-
-    int y = 0;
-    for (y = 0; y < pngHeight; y++)
-    {
-        png_write_row(pngPtr, pngImagePtr + (pngPitch * y));
-    }
-
-    png_write_end(pngPtr, NULL);
-    png_destroy_write_struct(&pngPtr, &infoPtr);
-
-    if (pngfp != stdout)
-    {
-        fclose(pngfp);
-    }
-
-    //-------------------------------------------------------------------
-
-    free(pngImagePtr);
-    pngImagePtr = NULL;
-
     return 0;
 }
 
+void screenshot(void){
+  int result = vc_dispmanx_snapshot(displayHandle, resourceHandle, DISPMANX_NO_ROTATE);
+  if (result != 0)
+  {
+      vc_dispmanx_resource_delete(resourceHandle);
+      vc_dispmanx_display_close(displayHandle);
+
+      fprintf(stderr, "%s: vc_dispmanx_snapshot() failed\n", program);
+      exit(EXIT_FAILURE);
+  }
+  result = vc_dispmanx_rect_set(&rect, 0, 0, RESOLUTION_X, TOP_BLOCKSIZE_Y);
+  result = vc_dispmanx_resource_read_data(resourceHandle, &rect, dmxImagePtr, dmxPitch);
+}
+
+void clean_up(void){
+  for(int x = 0, l = LED_COUNT; x < l; x++){
+    ledstring.channel[0].leds[x] = 0;
+  }
+  printf("Turning off LEDs.\n");
+}
+
+void init(void){
+  RIGHT_LENGTH = RIGHT_STOP_LED - RIGHT_START_LED;
+  TOP_LENGTH = TOP_STOP_LED - TOP_START_LED;
+  LEFT_LENGTH = LEFT_STOP_LED - LEFT_START_LED;
+  BOTTOM_LENGTH = BOTTOM_STOP_LED - BOTTOM_START_LED;
+
+  TOP_BLOCKSIZE_X = RESOLUTION_X / TOP_LENGTH;
+  TOP_BLOCKSIZE_Y = RESOLUTION_Y / BLOCKSIZE_DIVISION_OF_RESOLUTION;
+
+  BOTTOM_BLOCKSIZE_X = RESOLUTION_X / BOTTOM_LENGTH;
+  BOTTOM_BLOCKSIZE_Y = RESOLUTION_Y / BLOCKSIZE_DIVISION_OF_RESOLUTION;
+
+  LEFT_BLOCKSIZE_X = RESOLUTION_X / BLOCKSIZE_DIVISION_OF_RESOLUTION;
+  LEFT_BLOCKSIZE_Y = RESOLUTION_Y / LEFT_LENGTH;
+
+  RIGHT_BLOCKSIZE_X = RESOLUTION_X / BLOCKSIZE_DIVISION_OF_RESOLUTION;
+  RIGHT_BLOCKSIZE_Y = RESOLUTION_Y / RIGHT_LENGTH;
+
+  color = (Color*) malloc(sizeof(Color));
+  on_exit(clean_up, NULL);
+}
+
+void image_get_average_color(int xOffset, int yOffset, int xWidth, int yHeight){
+  int red = 0;
+  int green = 0;
+  int blue = 0;
+
+  char *colorPtr = dmxImagePtr;
+  colorPtr += xOffset;
+  colorPtr += yOffset * RESOLUTION_X;
+
+  char *colorPtrX = colorPtr;
+  for (int x = 0, l = xWidth; x < l; x++)
+  {
+    char *colorPtrY = colorPtrX;
+    for (int y = 0, k = yHeight; y < k; y++)
+    {
+      red += *colorPtrY;
+      colorPtrY++;
+      green += *colorPtrY;
+      colorPtrY++;
+      blue += *colorPtrY;
+      colorPtrY++;
+      colorPtrY++;
+
+      colorPtrY += RESOLUTION_X * sizeof(int);
+    }
+    colorPtrX += sizeof(int);
+  }
+  int factor = xWidth * yHeight;
+  color->red = red / factor;
+  color->green = green / factor;
+  color->blue = blue / factor;
+}
+
+void calculate_colors(void){
+  calculate_top();
+  calculate_left();
+  calculate_right();
+  calculate_bottom();
+}
+
+void calculate_top(){
+  for(int x = 0, l = TOP_LENGTH; x < l; x++){
+    image_get_average_color(x * TOP_BLOCKSIZE_X, 0, TOP_BLOCKSIZE_X, TOP_BLOCKSIZE_Y);
+    ledstring.channel[0].leds[TOP_STOP_LED - x] = ((color.blue << 16) + (color.green << 8) + color.red);
+    //printf("Pixel %d: rgb: %d %d %d\n", x, color.red, color.green, color.blue);
+  }
+}
+
+void calculate_left(){
+  for(int x = 0, l = LEFT_LENGTH; x < l; x++){
+    image_get_average_color(0, x * LEFT_BLOCKSIZE_Y, LEFT_BLOCKSIZE_X, LEFT_BLOCKSIZE_Y);
+    ledstring.channel[0].leds[LEFT_START_LED + x] = (color.blue << 16) + (color.green << 8) + color.red;
+    //printf("Pixel %d: rgb: %d %d %d\n", x, color.red, color.green, color.blue);
+  }
+}
+
+void calculate_bottom(){
+  for(int x = 0, l = BOTTOM_LENGTH; x < l; x++){
+    image_get_average_color(x * BOTTOM_BLOCKSIZE_X, 0, BOTTOM_BLOCKSIZE_X, BOTTOM_BLOCKSIZE_Y);
+    ledstring.channel[0].leds[BOTTOM_START_LED + x] = (color.blue << 16) + (color.green << 8) + color.red;
+    //printf("Pixel %d: rgb: %d %d %d\n", x, color.red, color.green, color.blue);
+  }
+}
+
+void calculate_right(){
+  for(int x = 0, l = RIGHT_LENGTH; x < l; x++){
+    image_get_average_color(0, x * RIGHT_BLOCKSIZE_Y, RIGHT_BLOCKSIZE_X, RIGHT_BLOCKSIZE_Y);
+    ledstring.channel[0].leds[RIGHT_STOP_LED - x] = (color.blue << 16) + (color.green << 8) + color.red;
+    //printf("Pixel %d: rgb: %d %d %d\n", x, color.red, color.green, color.blue);
+  }
+}
